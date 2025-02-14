@@ -14,17 +14,13 @@ import contextlib
 import logging.config
 from urllib.parse import urlparse
 
-__version__ = "0.6.8"
+__version__ = "0.8.0"
 
 
 DEFAULT_LOG_CONFIG = {
     "version": 1,
-    "formatters": {
-        "standard": {"format": "%(asctime)s %(levelname)8s %(name)s: %(message)s"}
-    },
-    "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "standard"}
-    },
+    "formatters": {"standard": {"format": "%(asctime)s %(levelname)8s %(name)s: %(message)s"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "standard"}},
     "root": {"handlers": ["console"], "level": "INFO"},
 }
 
@@ -56,15 +52,11 @@ class Connection:
 
     @property
     def opened(self):
-        return (
-            self.writer is not None
-            and not self.writer.is_closing()
-            and not self.reader.at_eof()
-        )
+        return self.writer is not None and not self.writer.is_closing() and not self.reader.at_eof()
 
     async def close(self):
         if self.writer is not None:
-            self.log.debug("closing connection...")
+            self.log.info("closing connection...")
             try:
                 self.writer.close()
                 await self.writer.wait_closed()
@@ -117,7 +109,7 @@ class Client(Connection):
     def __init__(self, reader, writer):
         peer = writer.get_extra_info("peername")
         super().__init__(f"Client({peer[0]}:{peer[1]})", reader, writer)
-        self.log.debug("new client connection")
+        self.log.info("new client connection")
 
 
 class ModBus(Connection):
@@ -132,6 +124,7 @@ class ModBus(Connection):
         self.modbus_port = url.port
         self.timeout = modbus.get("timeout", None)
         self.connection_time = modbus.get("connection_time", 0)
+        self.unit_id_remapping = config.get("unit_id_remapping") or {}
         self.server = None
         self.lock = asyncio.Lock()
 
@@ -142,9 +135,7 @@ class ModBus(Connection):
 
     async def open(self):
         self.log.info("connecting to modbus...")
-        self.reader, self.writer = await asyncio.open_connection(
-            self.modbus_host, self.modbus_port
-        )
+        self.reader, self.writer = await asyncio.open_connection(self.modbus_host, self.modbus_port)
         self.log.info("connected!")
 
     async def connect(self):
@@ -162,14 +153,31 @@ class ModBus(Connection):
                     coro = self._write_read(data)
                     return await asyncio.wait_for(coro, self.timeout)
                 except Exception as error:
-                    self.log.error(
-                        "write_read error [%s/%s]: %r", i + 1, attempts, error
-                    )
+                    self.log.error("write_read error [%s/%s]: %r", i + 1, attempts, error)
                     await self.close()
 
     async def _write_read(self, data):
         await self._write(data)
         return await self._read()
+
+    def _transform_request(self, request):
+        uid = request[6]
+        new_uid = self.unit_id_remapping.setdefault(uid, uid)
+        if uid != new_uid:
+            request = bytearray(request)
+            request[6] = new_uid
+            self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
+        return request
+
+    def _transform_reply(self, reply):
+        uid = reply[6]
+        inverse_unit_id_map = {v: k for k, v in self.unit_id_remapping.items()}
+        new_uid = inverse_unit_id_map.setdefault(uid, uid)
+        if uid != new_uid:
+            reply = bytearray(reply)
+            reply[6] = new_uid
+            self.log.debug("remapping unit ID %s to %s in reply", uid, new_uid)
+        return reply
 
     async def handle_client(self, reader, writer):
         async with Client(reader, writer) as client:
@@ -177,17 +185,15 @@ class ModBus(Connection):
                 request = await client.read()
                 if not request:
                     break
-                reply = await self.write_read(request)
+                reply = await self.write_read(self._transform_request(request))
                 if not reply:
                     break
-                result = await client.write(reply)
+                result = await client.write(self._transform_reply(reply))
                 if not result:
                     break
 
     async def start(self):
-        self.server = await asyncio.start_server(
-            self.handle_client, self.host, self.port, start_serving=True
-        )
+        self.server = await asyncio.start_server(self.handle_client, self.host, self.port, start_serving=True)
 
     async def stop(self):
         if self.server is not None:
@@ -222,30 +228,16 @@ def load_config(file_name):
         return load(fobj)
 
 
-def prepare_log(config, log_config_file=None):
+def prepare_log(config):
     cfg = config.get("logging")
     if not cfg:
-        if log_config_file:
-            if log_config_file.endswith("ini") or log_config_file.endswith("conf"):
-                logging.config.fileConfig(
-                    log_config_file, disable_existing_loggers=False
-                )
-            else:
-                cfg = load_config(log_config_file)
-        else:
-            cfg = DEFAULT_LOG_CONFIG
+        cfg = DEFAULT_LOG_CONFIG
     if cfg:
         cfg.setdefault("version", 1)
         cfg.setdefault("disable_existing_loggers", False)
         logging.config.dictConfig(cfg)
     warnings.simplefilter("always", DeprecationWarning)
     logging.captureWarnings(True)
-    if log_config_file:
-        warnings.warn(
-            "log-config-file deprecated. Use config-file instead", DeprecationWarning
-        )
-        if "logging" in config:
-            log.warning("log-config-file ignored. Using config file logging")
     return log
 
 
@@ -254,9 +246,7 @@ def parse_args(args=None):
         description="ModBus proxy",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "-c", "--config-file", default=None, type=str, help="config file"
-    )
+    parser.add_argument("-c", "--config-file", default=None, type=str, help="config file")
     parser.add_argument("-b", "--bind", default=None, type=str, help="listen address")
     parser.add_argument(
         "--modbus",
@@ -276,12 +266,6 @@ def parse_args(args=None):
         default=10,
         help="modbus connection and request timeout in seconds",
     )
-    parser.add_argument(
-        "--log-config-file",
-        default=None,
-        type=str,
-        help="log configuration file. By default log to stderr with log level = INFO",
-    )
     options = parser.parse_args(args=args)
 
     if not options.config_file and not options.modbus:
@@ -293,7 +277,7 @@ def create_config(args):
     if args.config_file is None:
         assert args.modbus
     config = load_config(args.config_file) if args.config_file else {}
-    prepare_log(config, args.log_config_file)
+    prepare_log(config)
     log.info("Starting...")
     devices = config.setdefault("devices", [])
     if args.modbus:

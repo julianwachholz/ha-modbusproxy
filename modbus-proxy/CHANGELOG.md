@@ -2,6 +2,7 @@
 
 | Version | Change                                                      |
 | ------- | ----------------------------------------------------------- |
+| 1.0.19  | updated modbus-proxy to 0.8.0                               |
 | 1.0.18  | switching to proper workdir before installing venv          |
 | 1.0.17  | use of venv optional. it will use it only on rebuild        |
 | 1.0.16  | switched to using a venv for running modbus proxy           |
